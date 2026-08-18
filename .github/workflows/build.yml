@@ -75,8 +75,9 @@ jobs:
             libglm-dev libcurl4-openssl-dev libgtk-3-dev libngspice0-dev ngspice-dev \
             libocct-modeling-algorithms-dev libocct-modeling-data-dev libocct-data-exchange-dev \
             libocct-visualization-dev libocct-foundation-dev libocct-ocaf-dev \
-            unixodbc-dev libnng-dev libprotobuf-dev protobuf-compiler zlib1g-dev \
-            libharfbuzz-dev libzint-dev libpoppler-dev libpoppler-glib-dev shared-mime-info
+            unixodbc-dev libspnav-dev libnng-dev libprotobuf-dev protobuf-compiler zlib1g-dev \
+            libharfbuzz-dev libzint-dev libpoppler-dev libpoppler-glib-dev shared-mime-info \
+            python3-pytest python3-cairosvg python3-numpy doxygen
 
       - name: Check out patched KiCad
         run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad
