@@ -28,7 +28,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  # One release run per tag; manual runs are independent (they would otherwise
+  # queue behind each other because they all share the ref "main").
+  group: build-${{ github.ref }}-${{ github.event_name }}-${{ github.event.inputs.platforms || 'all' }}
   cancel-in-progress: false
 
 env:
