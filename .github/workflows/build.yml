@@ -564,11 +564,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Get-ChildItem C:\kwb\.out\*.exe | Format-Table Name, @{n='MB';e={[math]::Round($_.Length/1MB)}}
           Get-PSDrive C | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+          # upload-artifact ignores hidden (dot) directories such as the builder's .out.
+          Copy-Item C:\kwb\.out\kicad-*-x86_64.exe -Destination $env:GITHUB_WORKSPACE
+          Get-ChildItem "$env:GITHUB_WORKSPACE\kicad-*-x86_64.exe"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: C:\kwb\.out\kicad-*-x86_64.exe
+          path: kicad-*-x86_64.exe
           if-no-files-found: error
 
   release:
