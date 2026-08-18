@@ -1,0 +1,426 @@
+From 3f03ced2a3f415ea22d8277077529ce85d02c52a Mon Sep 17 00:00:00 2001
+From: Robert Hilton <robert.a.hilton.jr@gmail.com>
+Date: Mon, 17 Aug 2026 22:54:37 -0400
+Subject: [PATCH 1/2] eeschema: expose SyncSelection cross-probing to IPC API
+ clients
+
+API clients (plugins) had no way to make the schematic editor show a
+symbol: eeschema registers no selection handlers in 10.0, and RunAction
+is unhandled. Master gained a SyncSelection command for this in the
+cross-probe API rework; this brings that command to 10.0 in the
+smallest form that reuses what eeschema already has.
+
+The MAIL_SELECTION_FORCE body in KiwayMailIn is lifted into a public
+SCH_EDIT_FRAME::SyncSelectionFromSpec(), so the API handler and the
+PCB editor's cross-probe drive one implementation: findItemsFromSync-
+Selection, SCH_SELECTION_TOOL::SyncSelection (sheet switch, select,
+centre/zoom per preferences) and the selection flash. The handler
+turns the request's SelectionSpecs into the existing sync-string form
+(F<ref>, P<ref>/<pin>) and honours the on_selection preference for
+implicit contexts exactly as master does. The proto file is master's,
+unchanged, so clients written against master work here as-is.
+---
+ api/CMakeLists.txt                            |   1 +
+ .../commands/cross_probe_commands.proto       | 127 ++++++++++++++++++
+ eeschema/api/api_handler_sch.cpp              |  85 ++++++++++++
+ eeschema/api/api_handler_sch.h                |   4 +
+ eeschema/cross-probing.cpp                    |  76 ++++++-----
+ eeschema/sch_edit_frame.h                     |  13 ++
+ 6 files changed, 271 insertions(+), 35 deletions(-)
+ create mode 100644 api/proto/common/commands/cross_probe_commands.proto
+
+diff --git a/api/CMakeLists.txt b/api/CMakeLists.txt
+index 3093ecf672..e4bcc12f24 100644
+--- a/api/CMakeLists.txt
++++ b/api/CMakeLists.txt
+@@ -26,6 +26,7 @@ set( KIAPI_PROTO_SRCS
+     common/types/project_settings.proto
+ 
+     common/commands/base_commands.proto
++    common/commands/cross_probe_commands.proto
+     common/commands/editor_commands.proto
+     common/commands/project_commands.proto
+ 
+diff --git a/api/proto/common/commands/cross_probe_commands.proto b/api/proto/common/commands/cross_probe_commands.proto
+new file mode 100644
+index 0000000000..4253f57bec
+--- /dev/null
++++ b/api/proto/common/commands/cross_probe_commands.proto
+@@ -0,0 +1,127 @@
++/*
++ * This program source code file is part of KiCad, a free EDA CAD application.
++ *
++ * Copyright (C) 2026 KiCad Developers, see AUTHORS.txt for contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation, either version 3 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++syntax = "proto3";
++
++package kiapi.common.commands;
++
++import "common/types/base_types.proto";
++
++enum CrossProbeStatus
++{
++  CPS_UNSPECIFIED = 0;
++  CPS_OK          = 1;
++  CPS_NOT_FOUND   = 2;
++  CPS_INVALID     = 3;
++  CPS_DISABLED    = 4;
++}
++
++// Internal KiCad API; may be removed without notice.
++// When running in standalone, the first frame to start will get the well-known API socket path.
++// Others can use this to set up a bidirectional link.  Since we don't plan to keep standalone
++// mode around for the long-term, this is a temporary workaround that doesn't change the whole
++// paradigm of the API away from client-server.
++message CrossProbeAnnounce
++{
++  kiapi.common.types.FrameType frame_type = 1;
++  string socket_path = 2;
++  string api_token = 3;
++}
++
++// Internal KiCad API; may be removed without notice.
++message CrossProbeAnnounceResponse
++{
++  CrossProbeStatus status  = 1;
++  string message = 2;
++}
++
++message FootprintSelectionSpec
++{
++  string reference = 1;
++}
++
++message PadSelectionSpec
++{
++  // Parent footprint
++  string reference = 1;
++  string number = 2;
++}
++
++message SelectionSpec
++{
++  oneof spec {
++    FootprintSelectionSpec footprint = 1;
++    PadSelectionSpec pad = 2;
++    kiapi.common.types.SheetPath sheet_path = 3;
++  }
++}
++
++enum SyncSelectionMode
++{
++  SSM_UNKNOWN = 0;
++  SSM_ITEMS_ONLY = 1;
++  SSM_ITEMS_AND_NETS = 2;
++}
++
++enum SyncSelectionContext
++{
++  SSC_UNKNOWN = 0;
++
++  // Implicit user action (e.g. just clicking on an item)
++  SSC_IMPLICIT = 1;
++
++  // Explicit user action (e.g. running a "select in other window" action)
++  SSC_EXPLICIT = 2;
++}
++
++message SyncSelection
++{
++  SyncSelectionContext context = 1;
++  SyncSelectionMode mode = 2;
++  SelectionSpec focus_item = 3;
++  repeated SelectionSpec items = 4;
++}
++
++message SyncSelectionResponse
++{
++  CrossProbeStatus status = 1;
++  string message = 2;
++}
++
++message HighlightNets
++{
++  repeated string net_name = 1;
++}
++
++message HighlightNetsResponse
++{
++  CrossProbeStatus status  = 1;
++  string message = 2;
++}
++
++message FocusOnItem
++{
++  SelectionSpec focus_item = 1;
++}
++
++message FocusOnItemResponse
++{
++  CrossProbeStatus status  = 1;
++  string message = 2;
++}
+diff --git a/eeschema/api/api_handler_sch.cpp b/eeschema/api/api_handler_sch.cpp
+index 90b6e998ea..e8ac6792b9 100644
+--- a/eeschema/api/api_handler_sch.cpp
++++ b/eeschema/api/api_handler_sch.cpp
+@@ -24,6 +24,8 @@
+ #include <magic_enum.hpp>
+ #include <sch_commit.h>
+ #include <sch_edit_frame.h>
++#include <string_utils.h>
++#include <eeschema_settings.h>
+ #include <wx/filename.h>
+ 
+ #include <api/common/types/base_types.pb.h>
+@@ -40,6 +42,8 @@ API_HANDLER_SCH::API_HANDLER_SCH( SCH_EDIT_FRAME* aFrame ) :
+ {
+     registerHandler<GetOpenDocuments, GetOpenDocumentsResponse>(
+             &API_HANDLER_SCH::handleGetOpenDocuments );
++    registerHandler<SyncSelection, SyncSelectionResponse>(
++            &API_HANDLER_SCH::handleSyncSelection );
+ }
+ 
+ 
+@@ -302,3 +306,84 @@ std::optional<EDA_ITEM*> API_HANDLER_SCH::getItemFromDocument( const DocumentSpe
+ 
+     return std::nullopt;
+ }
++
++
++HANDLER_RESULT<SyncSelectionResponse> API_HANDLER_SCH::handleSyncSelection(
++        const HANDLER_CONTEXT<SyncSelection>& aCtx )
++{
++    // Cross-probing from an API client: the same thing the PCB editor's
++    // "Select on Schematic" does, driven over IPC.  Reuses the frame's
++    // MAIL_SELECTION_FORCE machinery, so sheet switching, centring and
++    // flashing all follow the user's cross-probing preferences.
++    SyncSelectionResponse response;
++
++    const CROSS_PROBING_SETTINGS& settings = m_frame->eeconfig()->m_CrossProbing;
++
++    if( !settings.on_selection && aCtx.Request.context() != SyncSelectionContext::SSC_EXPLICIT )
++    {
++        response.set_status( CrossProbeStatus::CPS_DISABLED );
++        response.set_message( "implicit selection sync disabled by user" );
++        return response;
++    }
++
++    auto specToEntry =
++            []( const SelectionSpec& aSpec ) -> std::optional<wxString>
++            {
++                switch( aSpec.spec_case() )
++                {
++                case SelectionSpec::kFootprint:
++                    return wxT( "F" ) + EscapeString( wxString::FromUTF8( aSpec.footprint().reference() ),
++                                                      CTX_IPC );
++
++                case SelectionSpec::kPad:
++                    return wxT( "P" ) + EscapeString( wxString::FromUTF8( aSpec.pad().reference() ), CTX_IPC )
++                           + wxT( "/" ) + EscapeString( wxString::FromUTF8( aSpec.pad().number() ), CTX_IPC );
++
++                default:
++                    // Sheet paths are not something the sync-string parser handles yet.
++                    return std::nullopt;
++                }
++            };
++
++    std::vector<wxString> entries;
++    bool                  focusOnFirst = false;
++
++    if( aCtx.Request.has_focus_item() )
++    {
++        if( std::optional<wxString> entry = specToEntry( aCtx.Request.focus_item() ) )
++        {
++            entries.push_back( *entry );
++            focusOnFirst = true;
++        }
++    }
++
++    for( const SelectionSpec& spec : aCtx.Request.items() )
++    {
++        std::optional<wxString> entry = specToEntry( spec );
++
++        if( entry && std::find( entries.begin(), entries.end(), *entry ) == entries.end() )
++            entries.push_back( *entry );
++    }
++
++    if( entries.empty() )
++    {
++        response.set_status( CrossProbeStatus::CPS_INVALID );
++        response.set_message( "no selectable items in request" );
++        return response;
++    }
++
++    wxString syncStr;
++
++    for( const wxString& entry : entries )
++    {
++        if( !syncStr.empty() )
++            syncStr += wxT( "," );
++
++        syncStr += entry;
++    }
++
++    m_frame->SyncSelectionFromSpec( syncStr.ToStdString(), focusOnFirst );
++
++    response.set_status( CrossProbeStatus::CPS_OK );
++    return response;
++}
+diff --git a/eeschema/api/api_handler_sch.h b/eeschema/api/api_handler_sch.h
+index 64e5189242..7a6418ba2a 100644
+--- a/eeschema/api/api_handler_sch.h
++++ b/eeschema/api/api_handler_sch.h
+@@ -23,6 +23,7 @@
+ 
+ #include <api/api_handler_editor.h>
+ #include <api/common/commands/editor_commands.pb.h>
++#include <api/common/commands/cross_probe_commands.pb.h>
+ #include <kiid.h>
+ 
+ using namespace kiapi;
+@@ -67,6 +68,9 @@ private:
+     HANDLER_RESULT<commands::GetOpenDocumentsResponse> handleGetOpenDocuments(
+             const HANDLER_CONTEXT<commands::GetOpenDocuments>& aCtx );
+ 
++    HANDLER_RESULT<commands::SyncSelectionResponse> handleSyncSelection(
++            const HANDLER_CONTEXT<commands::SyncSelection>& aCtx );
++
+     SCH_EDIT_FRAME* m_frame;
+ };
+ 
+diff --git a/eeschema/cross-probing.cpp b/eeschema/cross-probing.cpp
+index 8c06026b16..a924c626f5 100644
+--- a/eeschema/cross-probing.cpp
++++ b/eeschema/cross-probing.cpp
+@@ -848,6 +848,46 @@ findItemsFromSyncSelection( const SCHEMATIC& aSchematic, const std::string aSync
+ }
+ 
+ 
++void SCH_EDIT_FRAME::SyncSelectionFromSpec( const std::string& aSyncStr, bool aFocusOnFirst )
++{
++    std::optional<std::tuple<SCH_SHEET_PATH, SCH_ITEM*, std::vector<SCH_ITEM*>>> findRet =
++            findItemsFromSyncSelection( Schematic(), aSyncStr, aFocusOnFirst );
++
++    if( !findRet )
++        return;
++
++    auto& [sheetPath, focusItem, items] = *findRet;
++
++    m_syncingPcbToSchSelection = true; // recursion guard
++
++    GetToolManager()->GetTool<SCH_SELECTION_TOOL>()->SyncSelection( sheetPath, focusItem, items );
++
++    m_syncingPcbToSchSelection = false;
++
++    if( eeconfig()->m_CrossProbing.flash_selection )
++    {
++        wxLogTrace( traceCrossProbeFlash, "MAIL_SELECTION(_FORCE): flash enabled, items=%zu",
++                    items.size() );
++
++        if( items.empty() )
++        {
++            wxLogTrace( traceCrossProbeFlash, "MAIL_SELECTION(_FORCE): nothing to flash" );
++        }
++        else
++        {
++            std::vector<SCH_ITEM*> itemPtrs;
++            std::copy( items.begin(), items.end(), std::back_inserter( itemPtrs ) );
++
++            StartCrossProbeFlash( itemPtrs );
++        }
++    }
++    else
++    {
++        wxLogTrace( traceCrossProbeFlash, "MAIL_SELECTION(_FORCE): flash disabled" );
++    }
++}
++
++
+ void SCH_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
+ {
+     std::string& payload = mail.GetPayload();
+@@ -987,41 +1027,7 @@ void SCH_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
+ 
+         bool focusOnFirst = ( paramStr[0] == '1' );
+ 
+-        std::optional<std::tuple<SCH_SHEET_PATH, SCH_ITEM*, std::vector<SCH_ITEM*>>> findRet =
+-                findItemsFromSyncSelection( Schematic(), syncStr, focusOnFirst );
+-
+-        if( findRet )
+-        {
+-            auto& [sheetPath, focusItem, items] = *findRet;
+-
+-            m_syncingPcbToSchSelection = true; // recursion guard
+-
+-            GetToolManager()->GetTool<SCH_SELECTION_TOOL>()->SyncSelection( sheetPath, focusItem,
+-                                                                            items );
+-
+-            m_syncingPcbToSchSelection = false;
+-
+-            if( eeconfig()->m_CrossProbing.flash_selection )
+-            {
+-                wxLogTrace( traceCrossProbeFlash, "MAIL_SELECTION(_FORCE): flash enabled, items=%zu", items.size() );
+-                if( items.empty() )
+-                {
+-                    wxLogTrace( traceCrossProbeFlash, "MAIL_SELECTION(_FORCE): nothing to flash" );
+-                }
+-                else
+-                {
+-                    std::vector<SCH_ITEM*> itemPtrs;
+-                    std::copy( items.begin(), items.end(), std::back_inserter( itemPtrs ) );
+-
+-                    StartCrossProbeFlash( itemPtrs );
+-                }
+-            }
+-            else
+-            {
+-                wxLogTrace( traceCrossProbeFlash, "MAIL_SELECTION(_FORCE): flash disabled" );
+-            }
+-        }
+-
++        SyncSelectionFromSpec( syncStr, focusOnFirst );
+         break;
+     }
+ 
+diff --git a/eeschema/sch_edit_frame.h b/eeschema/sch_edit_frame.h
+index c02a4ed887..e1b01aa220 100644
+--- a/eeschema/sch_edit_frame.h
++++ b/eeschema/sch_edit_frame.h
+@@ -811,6 +811,19 @@ public:
+ 
+     bool IsSyncingSelection() { return m_syncingPcbToSchSelection; }
+ 
++    /**
++     * Select (and optionally focus on) the schematic items named by a cross-probe
++     * sync string, switching to their sheet as needed.  This is what a PCB editor
++     * cross-probe (MAIL_SELECTION / MAIL_SELECTION_FORCE) does; it is exposed so
++     * that the IPC API can drive the same behaviour.
++     *
++     * @param aSyncStr comma-separated entries: F<reference> for a symbol,
++     *                 P<reference>/<pin number> for a pin (CTX_IPC escaping).
++     * @param aFocusOnFirst center the view on the first entry, and select the
++     *                      remaining entries only if they share its sheet.
++     */
++    void SyncSelectionFromSpec( const std::string& aSyncStr, bool aFocusOnFirst );
++
+     /**
+      * Update a schematic symbol from a LIB_SYMBOL.
+      *
+-- 
+2.52.0
+

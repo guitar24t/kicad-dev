@@ -1,0 +1,28 @@
+From bd63f29600396e1bd50d8789275dead66556baa1 Mon Sep 17 00:00:00 2001
+From: Robert Hilton <robert.a.hilton.jr@gmail.com>
+Date: Mon, 17 Aug 2026 23:23:43 -0400
+Subject: [PATCH] ngspice: build with -Wno-invalid-specialization for Apple
+ clang 21
+
+ngspice 45.2's bundled cppduals specialises std::is_compound, which clang 21
+(Xcode 26) rejects by default with -Winvalid-specialization. Downgrade it so
+the dependency builds on current Xcode.
+---
+ kicad-mac-builder/ngspice.cmake | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kicad-mac-builder/ngspice.cmake b/kicad-mac-builder/ngspice.cmake
+index b412e16..1df161d 100644
+--- a/kicad-mac-builder/ngspice.cmake
++++ b/kicad-mac-builder/ngspice.cmake
+@@ -11,6 +11,7 @@ ExternalProject_Add(
+     COMMAND ./configure --prefix=${ngspice_INSTALL_DIR} --with-ngshared
+         --enable-xspice --enable-cider --disable-debug --disable-openmp
+         LDFLAGS=-L/usr/local/opt/bison/lib
++        CXXFLAGS=-Wno-invalid-specialization
+     BUILD_COMMAND  ${BIN_DIR}/run-with-path.sh ${CMAKE_MAKE_PROGRAM} /usr/local/opt/bison/bin:$ENV{PATH}
+     BUILD_IN_SOURCE 1
+     INSTALL_COMMAND make install
+-- 
+2.52.0
+
