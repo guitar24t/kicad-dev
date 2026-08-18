@@ -76,8 +76,13 @@ simply re-run it — the second attempt continues from the cache.
 
 ## Package notes
 
-* macOS: `.dmg` from kicad-mac-builder (nightly-style packaging, libraries
-  included, unsigned — right-click > Open the first time).
+* macOS: `.dmg` from kicad-mac-builder — symbol/footprint/template libraries
+  included, the ~5 GB 3D model library left out (set `KICAD10_3DMODEL_DIR` to
+  an existing copy). The app is ad-hoc signed and re-sealed after the models
+  are removed (CI verifies with `codesign --verify --deep --strict`); with no
+  Apple Developer ID, Gatekeeper still blocks the first launch of a downloaded
+  copy — clear it with `xattr -dr com.apple.quarantine /Applications/KiCad.app`
+  or allow it under System Settings > Privacy & Security.
 * Windows: portable `.zip` (no installer): unzip, run `bin\kicad.exe`. Python is
   bundled (KiCad's plugin venvs need it); symbol/footprint libraries are not.
 * Linux: `.tar.zst` built on Ubuntu 24.04, installs to `/opt/kicad-custom`;

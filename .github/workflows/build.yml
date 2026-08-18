@@ -238,7 +238,16 @@ jobs:
         run: |
           ls kicad-dest
           du -sh kicad-dest/KiCad.app/Contents/SharedSupport/* 2>/dev/null | sort -h | tail -8 || true
+          # The stock 3D model library is ~5 GB unpacked; leave it out. Removing
+          # anything from an already-signed bundle stales its resource seal, and
+          # macOS then refuses to launch the app ("damaged") -- so re-seal the
+          # outer bundle exactly as kicad-mac-builder signed it (ad-hoc, same
+          # entitlements; nested code is untouched and stays valid), then prove it.
           rm -rf kicad-dest/KiCad.app/Contents/SharedSupport/3dmodels
+          codesign --force --sign - \
+            --entitlements ../kicad-mac-builder/signing/entitlements.plist \
+            kicad-dest/KiCad.app
+          codesign --verify --deep --strict --verbose=1 kicad-dest/KiCad.app
           mkdir -p dmg-root
           # Only the app and its demos go in; symlink to /Applications for drag-install.
           cp -R kicad-dest/KiCad.app dmg-root/
@@ -399,7 +408,7 @@ jobs:
             done
             echo
             echo "### Downloads"
-            echo "- macOS (Apple Silicon): the \`.dmg\` — drag KiCad to Applications; unsigned, so right-click > Open the first time."
+            echo "- macOS (Apple Silicon): the \`.dmg\` — drag KiCad to Applications. The app is ad-hoc signed (no Apple Developer ID), so Gatekeeper blocks the first launch; clear the quarantine flag once with \`xattr -dr com.apple.quarantine /Applications/KiCad.app\` (or allow it under System Settings > Privacy & Security). The stock 3D model library is not bundled — point \`KICAD10_3DMODEL_DIR\` (Preferences > Configure Paths) at an existing one, e.g. the official install's \`KiCad.app/Contents/SharedSupport/3dmodels\`."
             echo "- Windows x64: the \`.zip\` — a portable tree, unzip and run \`bin\\kicad.exe\` (see README-INSTALL.txt inside)."
             echo "- Linux x86_64: the \`.tar.zst\` — built on Ubuntu 24.04, installs to \`/opt/kicad-custom\` (see README-INSTALL.txt inside)."
             echo
