@@ -18,6 +18,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Platforms to build (comma-separated: linux,macos,windows)"
+        default: "linux,macos,windows"
+        required: true
 
 permissions:
   contents: write
@@ -49,6 +54,7 @@ jobs:
           echo "Building KiCad $version"
 
   linux:
+    if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'linux')
     name: linux x86_64
     needs: meta
     runs-on: ubuntu-24.04
@@ -127,6 +133,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'macos')
     name: macos arm64
     needs: meta
     runs-on: macos-15
@@ -173,6 +180,14 @@ jobs:
 
       - name: Build dependencies, KiCad and the DMG
         working-directory: kicad-mac-builder
+        env:
+          # CMake picks these up as the compiler launcher (3.17+); build.py's
+          # --extra-kicad-cmake-args quotes its value literally, so env it is.
+          # --release-name is deliberately not used: it flips kicad-mac-builder
+          # into "release build" mode, which insists on cloning a KICAD_TAG
+          # instead of using our patched source dir.
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           source ../upstream.env
           ccache -z || true
@@ -182,11 +197,10 @@ jobs:
             --build-type Release \
             --symbols-ref "$LIB_REF" --footprints-ref "$LIB_REF" \
             --templates-ref "$LIB_REF" --packages3d-ref "$LIB_REF" \
-            --release-name "kicad-$VERSION" \
-            --extra-kicad-cmake-args "-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DKICAD_USE_SENTRY=OFF" \
             --target package-kicad-nightly
           ccache -s || true
           ls -la build/dmg/
+          mv build/dmg/kicad-nightly-*.dmg "build/dmg/kicad-$VERSION-macos-arm64.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -195,6 +209,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'windows')
     name: windows x64
     needs: meta
     runs-on: windows-2022
