@@ -159,8 +159,11 @@ jobs:
       - name: Check out patched KiCad and kicad-mac-builder
         run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh
 
-      - name: Cache built dependencies (wxWidgets, Python, wxPython, ngspice)
-        uses: actions/cache@v4
+      # Restore/save split so the caches are written even when a later step
+      # fails: an hour of dependency compilation should survive one bad step.
+      - name: Restore built dependencies (wxWidgets, Python, wxPython, ngspice)
+        id: kmb-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             kicad-mac-builder/build/wxwidgets
@@ -172,8 +175,9 @@ jobs:
             kicad-mac-builder/build/ngspice-dest
           key: kmb-deps-${{ runner.os }}-${{ runner.arch }}-${{ env.MACOS_MIN }}-${{ hashFiles('upstream.env', 'patches/kicad-mac-builder/*') }}-v1
 
-      - name: ccache
-        uses: actions/cache@v4
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@v4
         with:
           path: ~/Library/Caches/ccache
           key: ccache-macos-${{ hashFiles('upstream.env', 'patches/kicad/*') }}-${{ github.run_id }}
@@ -194,21 +198,60 @@ jobs:
         run: |
           source ../upstream.env
           ccache -z || true
+          # --target kicad builds the deps, KiCad, and installs the symbol,
+          # footprint, template, 3D-model and doc libraries into the bundle
+          # (ad-hoc signed). kicad-mac-builder's own packaging on this branch
+          # only supports the "unified" DMG (with the multi-GB 3D models), so
+          # the DMG is made here instead, without the 3D models.
           WX_SKIP_DOXYGEN_VERSION_CHECK=1 ./build.py --arch arm64 \
             --kicad-source-dir "$PWD/../kicad" \
             --macos-min-version "$MACOS_MIN" \
             --build-type Release \
             --symbols-ref "$LIB_REF" --footprints-ref "$LIB_REF" \
             --templates-ref "$LIB_REF" --packages3d-ref "$LIB_REF" \
-            --target package-kicad-nightly
+            --target kicad
           ccache -s || true
-          ls -la build/dmg/
-          mv build/dmg/kicad-nightly-*.dmg "build/dmg/kicad-$VERSION-macos-arm64.dmg"
+
+      - name: Save built dependencies
+        if: always() && steps.kmb-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            kicad-mac-builder/build/wxwidgets
+            kicad-mac-builder/build/wxwidgets-dest
+            kicad-mac-builder/build/python
+            kicad-mac-builder/build/python-dest
+            kicad-mac-builder/build/wxpython-prefix
+            kicad-mac-builder/build/ngspice
+            kicad-mac-builder/build/ngspice-dest
+          key: ${{ steps.kmb-cache.outputs.cache-primary-key }}
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Make the DMG
+        working-directory: kicad-mac-builder/build
+        run: |
+          ls kicad-dest
+          du -sh kicad-dest/KiCad.app/Contents/SharedSupport/* 2>/dev/null | sort -h | tail -8 || true
+          rm -rf kicad-dest/KiCad.app/Contents/SharedSupport/3dmodels
+          mkdir -p dmg-root
+          # Only the app and its demos go in; symlink to /Applications for drag-install.
+          cp -R kicad-dest/KiCad.app dmg-root/
+          [ -d kicad-dest/demos ] && cp -R kicad-dest/demos dmg-root/ || true
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "KiCad $VERSION" -srcfolder dmg-root -ov -format UDZO -imagekey zlib-level=9 \
+            "kicad-$VERSION-macos-arm64.dmg"
+          ls -la *.dmg
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: kicad-mac-builder/build/dmg/*.dmg
+          path: kicad-mac-builder/build/kicad-*-macos-arm64.dmg
           if-no-files-found: error
 
   windows:
