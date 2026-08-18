@@ -2,7 +2,9 @@
 
 Our KiCad 10: upstream stable plus a small patch queue, with a reproducible
 local dev build and CI that ships packages for Linux, macOS (Apple Silicon)
-and Windows on the releases page.
+and Windows on the releases page — built with KiCad's own release packagers
+(kicad-mac-builder, kicad-win-builder, kicad-appimage), so they install like
+the official releases, libraries and 3D models included.
 
 Why: KiCad 10's schematic editor cannot be asked over its API to select or
 show a symbol (its API has no selection handlers). KiCad master added a
@@ -13,15 +15,16 @@ PCB open. See `patches/`.
 ## Layout
 
 ```
-upstream.env         pinned upstream refs (KiCad tag, kicad-mac-builder commit, library tag)
+upstream.env         pinned upstream refs (KiCad tag, the three packagers' commits, library tag)
 patches/kicad/       our KiCad commits, as `git format-patch` output (the source of truth)
-patches/kicad-mac-builder/   ditto for the macOS dependency builder
-scripts/bootstrap.sh check out upstream at the pins and apply the patches -> kicad/, kicad-mac-builder/
-scripts/export-patches.sh    regenerate patches/ after committing in kicad/ or kicad-mac-builder/
+patches/kicad-mac-builder/, patches/kicad-win-builder/   ditto for the packagers
+linux/appimage.env   dependency-image tags and pins for the official AppImage recipe
+scripts/bootstrap.sh check out upstream at the pins and apply the patches -> kicad/, kicad-*-builder/, kicad-appimage/
+scripts/export-patches.sh    regenerate patches/ after committing in one of those trees
 scripts/version.sh   release name from the git tag (v10.0.5a -> 10.0.5a)
 build-kicad.sh       macOS local dev build (incremental) -> install/KiCad.app
 .github/workflows/build.yml   CI: build all three platforms; publish a release on tags
-kicad/, kicad-mac-builder/, install/, logs/   local only (git-ignored)
+kicad/, kicad-mac-builder/, kicad-win-builder/, kicad-appimage/, install/, logs/   local only (git-ignored)
 ```
 
 ## Versioning
@@ -60,8 +63,9 @@ git tag v10.0.5b && git push origin v10.0.5b
 ```
 
 CI (`build.yml`) then builds Linux, macOS and Windows and creates the GitHub
-release with a `.tar.zst`, `.dmg` and `.zip`. `workflow_dispatch` runs the
-builds without a release. Nothing runs on ordinary pushes.
+release with the AppImages, the unified `.dmg` and the NSIS `.exe`.
+`workflow_dispatch` runs the builds without a release. Nothing runs on
+ordinary pushes.
 
 **Cost:** a full KiCad build is hours of runner time per platform, and macOS
 runners are billed at 10× on private repositories (a single macOS build can
@@ -70,20 +74,31 @@ builds free; alternatively run only the platform you need via
 `workflow_dispatch` on a fork, or accept the metered minutes.
 
 **First Windows run:** the vcpkg dependency set (OCCT, wxWidgets, Boost, Python,
-wxPython…) is several hours to compile; it is cached per port, and the cache is
-saved even if the job times out, so if the first Windows job runs out of time,
-simply re-run it — the second attempt continues from the cache.
+wxPython…) is ~5 hours to compile, so it has its own job (`windows x64 (vcpkg
+dependencies)`) whose per-port binary cache is saved even if it times out; the
+installer job restores it and configures in minutes. Actions caches are scoped
+to the ref that created them: a cache made by a tag run is invisible to
+`workflow_dispatch` runs on `main` (and vice versa is fine — `main` caches are
+visible everywhere), so the first run on `main` is a cold one.
 
 ## Package notes
 
-* macOS: `.dmg` from kicad-mac-builder — symbol/footprint/template libraries
-  included, the ~5 GB 3D model library left out (set `KICAD10_3DMODEL_DIR` to
-  an existing copy). The app is ad-hoc signed and re-sealed after the models
-  are removed (CI verifies with `codesign --verify --deep --strict`); with no
-  Apple Developer ID, Gatekeeper still blocks the first launch of a downloaded
-  copy — clear it with `xattr -dr com.apple.quarantine /Applications/KiCad.app`
-  or allow it under System Settings > Privacy & Security.
-* Windows: portable `.zip` (no installer): unzip, run `bin\kicad.exe`. Python is
-  bundled (KiCad's plugin venvs need it); symbol/footprint libraries are not.
-* Linux: `.tar.zst` built on Ubuntu 24.04, installs to `/opt/kicad-custom`;
-  needs the distro's runtime packages (README-INSTALL.txt inside).
+* macOS: kicad-mac-builder's unified `.dmg` (`--target package-kicad-unified`),
+  the same layout as kicad.org's: a *KiCad* folder with KiCad.app (symbols,
+  footprints, templates, 3D models and the 10.0 documentation inside) plus the
+  demos, dragged to /Applications. The docs are the kicad-doc project's own 10.0
+  build artifact — the builder's default docs URL is a 2019 KiCad-5.1 tarball.
+  The app is ad-hoc signed by the builder and shipped untouched; with no Apple
+  Developer ID, Gatekeeper still blocks the first launch of a downloaded copy
+  (System Settings › Privacy & Security › Open Anyway, or
+  `xattr -dr com.apple.quarantine /Applications/KiCad`).
+* Windows: kicad-win-builder's NSIS installer (`kicad-<ver>-x86_64.exe`) with
+  the libraries and bundled Python, exactly the official one minus code signing
+  (SmartScreen warns; *More info › Run anyway*). It installs as "KiCad 10.0"
+  and therefore replaces an official 10.0.x install. Our only builder change
+  (patches/kicad-win-builder) makes its vcpkg configure use KiCad's own triplet
+  overlay and cache-stable install options so the binary cache is reusable.
+* Linux: the official AppImage recipe (kicad-appimage's Dockerfile, run through
+  docker buildx against our source with the dependency images from its public
+  registry): a full image with the 3D models and a *lite* one without, shipped
+  as `.AppImage.tar` like kicad.org. Nothing else is required on the host.

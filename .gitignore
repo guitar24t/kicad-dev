@@ -1,10 +1,15 @@
 # Upstream checkouts (recreated by scripts/bootstrap.sh) and everything built.
 /kicad/
 /kicad-mac-builder/
+/kicad-win-builder/
+/kicad-appimage/
 /install/
 /logs/
 /build/
 *.dmg
 *.tar.zst
 *.zip
+*.exe
+*.AppImage
+*.AppImage.tar
 .DS_Store

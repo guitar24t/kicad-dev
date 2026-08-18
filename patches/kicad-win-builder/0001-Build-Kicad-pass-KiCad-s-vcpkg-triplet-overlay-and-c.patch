@@ -1,0 +1,38 @@
+From f85aa9fc2d31d1d9ab5acb36efbd7ecbfa05bd35 Mon Sep 17 00:00:00 2001
+From: Robert Hilton <robert.a.hilton.jr@gmail.com>
+Date: Tue, 18 Aug 2026 12:10:05 -0400
+Subject: [PATCH] Build-Kicad: pass KiCad's vcpkg triplet overlay and
+ cache-stable install options
+
+The custom x64-windows triplet in KiCad's tree sets
+VCPKG_DISABLE_COMPILER_TRACKING and --x-abi-tools-use-exact-versions pins
+the tool part of the ABI hash, so a vcpkg binary cache built by one job is
+reusable by another and outlives compiler updates on hosted runners.
+--clean-after-build drops the multi-GB buildtrees. KiCad's own GitLab
+Windows CI uses the same overlay and options.
+---
+ build.ps1 | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/build.ps1 b/build.ps1
+index 573fee0..24ae319 100644
+--- a/build.ps1
++++ b/build.ps1
+@@ -575,7 +575,13 @@ function Build-Kicad {
+         "-DCMAKE_MAKE_PROGRAM=$env:NINJA_PATH",
+         '-DKICAD_BUILD_QA_TESTS=OFF',
+         '-DKICAD_BUILD_I18N=ON',
+-        '-DKICAD_WIN32_DPI_AWARE=ON'
++        '-DKICAD_WIN32_DPI_AWARE=ON',
++        # KiCad's own triplet overlay disables vcpkg compiler tracking and the
++        # exact-tool-version ABI keeps port hashes stable across builders, so a
++        # binary cache survives runner image updates; clean-after-build keeps
++        # buildtrees off the disk. Same flags KiCad's GitLab Windows CI passes.
++        "-DVCPKG_OVERLAY_TRIPLETS=$(Get-Source-Path kicad)/tools/custom_vcpkg_triplets",
++        '-DVCPKG_INSTALL_OPTIONS=--clean-after-build;--x-abi-tools-use-exact-versions'
+     )
+ 
+     if( $settings.SentryDsn -ne "" ) {
+-- 
+2.52.0
+

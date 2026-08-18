@@ -1,14 +1,22 @@
-# Build our patched KiCad for Linux, macOS (arm64) and Windows, and publish
-# the packages on the GitHub release for a tag.
+# Build our patched KiCad with the same packaging tools KiCad's own releases
+# use, and publish the packages on the GitHub release for a tag:
+#
+#   macOS    kicad-mac-builder  "unified" DMG   (KiCad.app + symbols, footprints,
+#                                                templates, 3D models, docs; installs
+#                                                to /Applications/KiCad like upstream)
+#   Windows  kicad-win-builder  NSIS installer   (kicad-<ver>-x86_64.exe with the
+#                                                libraries, same as kicad.org)
+#   Linux    kicad-appimage     AppImage         (full + lite, the official Linux
+#                                                download on kicad.org)
 #
 # Triggers:
 #   * pushing a tag  v<kicad version><letter>   e.g. v10.0.5a  -> builds + release
 #   * workflow_dispatch                          -> builds only (dev snapshot)
 #
 # Nothing runs on ordinary pushes: a full KiCad build is hours of runner time
-# per platform (macOS runners bill at 10x on private repos), so it is opt-in.
+# per platform, so it is opt-in.
 #
-# Sources: upstream KiCad and kicad-mac-builder at the refs pinned in
+# Sources: upstream KiCad and the three packagers at the refs pinned in
 # upstream.env, with patches/ applied (scripts/bootstrap.sh) -- exactly what
 # the local dev tree in this repo is.
 
@@ -55,9 +63,16 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "is_release=true" >> "$GITHUB_OUTPUT"; else echo "is_release=false" >> "$GITHUB_OUTPUT"; fi
           echo "Building KiCad $version"
 
+  # ---------------------------------------------------------------------------
+  # Linux: the official AppImage recipe (gitlab.com/kicad/packaging/kicad-appimage),
+  # run verbatim through docker buildx against our patched source. Its
+  # dependency images (base toolchain, wxWidgets, wxPython, OCCT, ngspice, the
+  # symbol/footprint/template libraries and the 3D models) are pulled from the
+  # project's public registry at the tags the 10.0.5 release config resolves to.
+  # ---------------------------------------------------------------------------
   linux:
     if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'linux')
-    name: linux x86_64
+    name: linux x86_64 (AppImage)
     needs: meta
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -66,75 +81,99 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      # A RelWithDebInfo KiCad build tree plus the AppDir copies and the
+      # dependency images need tens of GB. Drop the preinstalled toolchains we
+      # never use, and keep docker's storage on whichever disk is larger.
+      - name: Make room
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build ccache pkg-config git \
-            libbz2-dev libcairo2-dev libglu1-mesa-dev libgl1-mesa-dev libglew-dev libx11-dev \
-            libwxgtk3.2-dev libwxgtk-webview3.2-dev mesa-common-dev libssl-dev libzstd-dev \
-            python3-dev python3-wxgtk4.0 swig libgit2-dev libsecret-1-dev libboost-all-dev \
-            libglm-dev libcurl4-openssl-dev libgtk-3-dev libngspice0-dev ngspice-dev \
-            libocct-modeling-algorithms-dev libocct-modeling-data-dev libocct-data-exchange-dev \
-            libocct-visualization-dev libocct-foundation-dev libocct-ocaf-dev \
-            unixodbc-dev libspnav-dev libnng-dev libprotobuf-dev protobuf-compiler zlib1g-dev \
-            libharfbuzz-dev libzint-dev libpoppler-dev libpoppler-glib-dev shared-mime-info \
-            python3-pytest python3-cairosvg python3-numpy doxygen
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / /mnt 2>/dev/null || true
+          if [ -d /mnt ] && [ "$(df --output=avail /mnt | tail -1)" -gt "$(df --output=avail / | tail -1)" ]; then
+            echo "Moving docker's data-root to /mnt"
+            sudo systemctl stop docker
+            sudo mkdir -p /mnt/docker
+            echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+            sudo systemctl start docker
+          fi
+          docker info --format 'docker data-root: {{.DockerRootDir}}'
 
-      - name: Check out patched KiCad
-        run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad
+      - name: Check out patched KiCad and kicad-appimage
+        run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad kicad-appimage
 
-      - name: ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-${{ hashFiles('upstream.env', 'patches/kicad/*') }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-linux-${{ hashFiles('upstream.env', 'patches/kicad/*') }}-
-            ccache-linux-
-
-      - name: Configure
+      - name: Build the AppImages
+        working-directory: kicad-appimage
         run: |
-          cmake -S kicad -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/opt/kicad-custom \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DKICAD_SCRIPTING_WXPYTHON=ON \
-            -DKICAD_BUILD_I18N=OFF \
-            -DKICAD_BUILD_QA_TESTS=OFF \
-            -DKICAD_USE_SENTRY=OFF \
-            -DKICAD_INSTALL_DEMOS=OFF
+          source ../upstream.env
+          source ../linux/appimage.env
+          docker buildx create --use --driver docker-container --name kicad >/dev/null
+          # KICAD_BUILD_RELEASE names the file (kicad-<ver>-x86_64.AppImage); the
+          # About-box version still comes from the annotated tag bootstrap.sh
+          # put on the source tree, exactly as on the other platforms. The
+          # AppImage-side patches are the release config's own list and are
+          # applied by the Dockerfile. No update URL: our images must never
+          # self-update from KiCad's CDN. QA test binaries are not part of the
+          # AppImage, so skip compiling them.
+          common=(
+            --build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
+            --build-context "kicad-src=$PWD/../kicad"
+            --build-arg "KICAD_BUILD_RELEASE=$VERSION"
+            --build-arg "KICAD_BUILD_MAJVERSION=${VERSION%%.*}"
+            --build-arg KICAD_BUILD_TYPE=Release
+            --build-arg APPIMAGE_PREFIX=kicad
+            --build-arg "KICAD_PATCHES=$KICAD_PATCHES"
+            --build-arg CMAKE_EXTRA_ARGS=-DKICAD_BUILD_QA_TESTS=OFF
+            --build-arg "BASE_TAG=$BASE_TAG"
+            --build-arg "WX_TAG=$WX_TAG"
+            --build-arg "WXPYTHON_TAG=$WXPYTHON_TAG"
+            --build-arg "OCCT_TAG=$OCCT_TAG"
+            --build-arg "NGSPICE_TAG=$NGSPICE_TAG"
+            --build-arg "LIBS_TAG=$LIBS_TAG"
+            --build-arg "PACKAGES3D_TAG=$PACKAGES3D_TAG"
+            --build-arg "SHARUN_VERSION=$SHARUN_VERSION"
+            --build-arg "URUNTIME_VERSION=$URUNTIME_VERSION"
+            --build-arg "DWARFS_VERSION=$DWARFS_VERSION"
+            --build-arg "SHARUN_SHA256=$SHARUN_SHA256"
+            --build-arg "URUNTIME_SHA256=$URUNTIME_SHA256"
+            --build-arg "DWARFS_SHA256=$DWARFS_SHA256"
+            --build-arg EXTRACT_DBGSYM=0
+            --build-arg PUBLISH_DEBUGINFOD=0
+            --build-arg GENERATE_ZSYNC=0
+            --progress=plain
+            --platform linux/amd64
+          )
+          docker buildx build "${common[@]}" --target build-kicad -o type=local,dest=out .
+          # The lite image (no 3D models) re-packs the same AppDir layers.
+          docker buildx build "${common[@]}" --target build-kicad-light -o type=local,dest=out .
+          ls -la out
+          df -h / /mnt 2>/dev/null || true
 
-      - name: Build
-        run: |
-          ccache -z
-          cmake --build build --parallel "$(nproc)"
-          ccache -s
-
+      # kicad.org ships the AppImages inside a tar so the executable bit
+      # survives the download; do the same.
       - name: Package
+        working-directory: kicad-appimage/out
         run: |
-          DESTDIR="$PWD/dist" cmake --install build >/dev/null
-          cat > dist/opt/kicad-custom/README-INSTALL.txt <<'TXT'
-          KiCad (custom build) for Linux x86_64 -- built on Ubuntu 24.04.
-
-          Install:   sudo tar --zstd -xf kicad-*-linux-x86_64.tar.zst -C /
-          Run:       /opt/kicad-custom/bin/kicad
-
-          Runtime packages (Ubuntu 24.04): libwxgtk3.2-1t64 libwxgtk-webview3.2-1t64
-          libocct-* libngspice0 libnng1 libprotobuf32t64 libgit2-1.7 libglew2.2 libcairo2
-          libcurl4 libsecret-1-0 libzint2.12 python3 python3-wxgtk4.0
-          Symbol/footprint libraries are not included; point KICAD10_SYMBOL_DIR etc.
-          at an existing KiCad 10 library install (Preferences > Configure Paths).
-          TXT
-          tar --zstd -cf "kicad-$VERSION-linux-x86_64.tar.zst" -C dist opt
-          ls -la kicad-*.tar.zst
+          rm -f -- *.minisig *.zsync
+          for f in *.AppImage; do
+            chmod +x "$f"
+            tar -cf "$f.tar" "$f"
+          done
+          ls -la
+          # Prove the full image runs headless and reports our version.
+          ./kicad-"$VERSION"-x86_64.AppImage --appimage-extract-and-run kicad-cli version --format about 2>/dev/null | head -5 || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: kicad-*-linux-x86_64.tar.zst
+          path: kicad-appimage/out/*.AppImage.tar
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # macOS: kicad-mac-builder's unified DMG (its package-kicad-unified target),
+  # i.e. exactly the layout of the official kicad-unified-*.dmg: a "KiCad"
+  # folder holding KiCad.app (with the libraries, 3D models and docs inside)
+  # plus the demos, dragged into /Applications.
+  # ---------------------------------------------------------------------------
   macos:
     if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'macos')
     name: macos arm64
@@ -157,7 +196,38 @@ jobs:
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
 
       - name: Check out patched KiCad and kicad-mac-builder
-        run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh
+        run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad kicad-mac-builder
+
+      # kicad-mac-builder's default docs tarball (docs.kicad.org/kicad-doc-HEAD.tar.gz)
+      # is a 2019 KiCad-5.1 snapshot and no versioned 10.0 tarball is published
+      # there, so take the kicad-doc project's own 10.0 branch build artifact
+      # (a zip wrapping the tar.gz the builder expects) and hand it over as a
+      # local file.
+      - name: Restore KiCad 10.0 documentation
+        id: docs-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: docs/kicad-doc-10.0.tar.gz
+          key: kicad-doc-10.0-${{ hashFiles('upstream.env') }}
+
+      - name: Fetch KiCad 10.0 documentation
+        if: steps.docs-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p docs
+          curl -fL --retry 3 -o docs/artifacts.zip \
+            'https://gitlab.com/api/v4/projects/kicad%2Fservices%2Fkicad-doc/jobs/artifacts/10.0/download?job=build_container'
+          unzip -j -o -q docs/artifacts.zip 'archive/*.tar.gz' -d docs
+          mv docs/kicad-doc-*.tar.gz docs/kicad-doc-10.0.tar.gz
+          rm docs/artifacts.zip
+          tar tzf docs/kicad-doc-10.0.tar.gz | grep -q 'share/doc/kicad/help/en/' || { echo "unexpected docs layout"; exit 1; }
+          ls -la docs
+
+      - name: Save KiCad 10.0 documentation
+        if: steps.docs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: docs/kicad-doc-10.0.tar.gz
+          key: ${{ steps.docs-cache.outputs.cache-primary-key }}
 
       # Restore/save split so the caches are written even when a later step
       # fails: an hour of dependency compilation should survive one bad step.
@@ -185,32 +255,32 @@ jobs:
             ccache-macos-${{ hashFiles('upstream.env', 'patches/kicad/*') }}-
             ccache-macos-
 
-      - name: Build dependencies, KiCad and the DMG
+      - name: Build dependencies, KiCad and the unified DMG
         working-directory: kicad-mac-builder
         env:
           # CMake picks these up as the compiler launcher (3.17+); build.py's
           # --extra-kicad-cmake-args quotes its value literally, so env it is.
           # --release-name is deliberately not used: it flips kicad-mac-builder
           # into "release build" mode, which insists on cloning a KICAD_TAG
-          # instead of using our patched source dir.
+          # instead of using our patched source dir. The About version comes
+          # from the annotated tag on the source tree; the DMG is renamed below.
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           source ../upstream.env
+          df -h / | tail -1
           ccache -z || true
-          # --target kicad builds the deps, KiCad, and installs the symbol,
-          # footprint, template, 3D-model and doc libraries into the bundle
-          # (ad-hoc signed). kicad-mac-builder's own packaging on this branch
-          # only supports the "unified" DMG (with the multi-GB 3D models), so
-          # the DMG is made here instead, without the 3D models.
           WX_SKIP_DOXYGEN_VERSION_CHECK=1 ./build.py --arch arm64 \
             --kicad-source-dir "$PWD/../kicad" \
             --macos-min-version "$MACOS_MIN" \
             --build-type Release \
             --symbols-ref "$LIB_REF" --footprints-ref "$LIB_REF" \
             --templates-ref "$LIB_REF" --packages3d-ref "$LIB_REF" \
-            --target kicad
+            --docs-tarball-url "$PWD/../docs/kicad-doc-10.0.tar.gz" \
+            --dmg-dir "$PWD/build/dmg" \
+            --target package-kicad-unified
           ccache -s || true
+          df -h / | tail -1
 
       - name: Save built dependencies
         if: always() && steps.kmb-cache.outputs.cache-hit != 'true'
@@ -233,54 +303,59 @@ jobs:
           path: ~/Library/Caches/ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
-      - name: Make the DMG
-        working-directory: kicad-mac-builder/build
+      # package.sh names the DMG by timestamp when it is not in release mode;
+      # give it our name and prove the bundle inside is intact and signed
+      # (nothing is modified after kicad-mac-builder signed it).
+      - name: Name and verify the DMG
+        working-directory: kicad-mac-builder/build/dmg
         run: |
-          ls kicad-dest
-          du -sh kicad-dest/KiCad.app/Contents/SharedSupport/* 2>/dev/null | sort -h | tail -8 || true
-          # The stock 3D model library is ~5 GB unpacked; leave it out. Removing
-          # anything from an already-signed bundle stales its resource seal, and
-          # macOS then refuses to launch the app ("damaged") -- so re-seal the
-          # outer bundle exactly as kicad-mac-builder signed it (ad-hoc, same
-          # entitlements; nested code is untouched and stays valid), then prove it.
-          rm -rf kicad-dest/KiCad.app/Contents/SharedSupport/3dmodels
-          codesign --force --sign - \
-            --entitlements ../kicad-mac-builder/signing/entitlements.plist \
-            kicad-dest/KiCad.app
-          codesign --verify --deep --strict --verbose=1 kicad-dest/KiCad.app
-          mkdir -p dmg-root
-          # Only the app and its demos go in; symlink to /Applications for drag-install.
-          cp -R kicad-dest/KiCad.app dmg-root/
-          [ -d kicad-dest/demos ] && cp -R kicad-dest/demos dmg-root/ || true
-          ln -s /Applications dmg-root/Applications
-          hdiutil create -volname "KiCad $VERSION" -srcfolder dmg-root -ov -format UDZO -imagekey zlib-level=9 \
-            "kicad-$VERSION-macos-arm64.dmg"
+          ls -la
+          mv kicad-unified-*.dmg "kicad-unified-arm64-$VERSION.dmg"
+          hdiutil verify "kicad-unified-arm64-$VERSION.dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/kicad-vol "kicad-unified-arm64-$VERSION.dmg"
+          ls -la /tmp/kicad-vol /tmp/kicad-vol/KiCad
+          codesign --verify --deep --strict --verbose=1 /tmp/kicad-vol/KiCad/KiCad.app
+          du -sh /tmp/kicad-vol/KiCad/KiCad.app/Contents/SharedSupport/* | sort -h
+          /tmp/kicad-vol/KiCad/KiCad.app/Contents/MacOS/kicad-cli version --format about | head -3
+          hdiutil detach /tmp/kicad-vol
           ls -la *.dmg
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: kicad-mac-builder/build/kicad-*-macos-arm64.dmg
+          path: kicad-mac-builder/build/dmg/kicad-unified-arm64-*.dmg
           if-no-files-found: error
 
-  windows:
+  # ---------------------------------------------------------------------------
+  # Windows, part 1: vcpkg dependencies. The dependency set (OCCT, wxWidgets,
+  # Boost, Python, wxPython, ...) is ~5 hours of compile on a 4-core runner --
+  # too much to share a 6-hour job with the KiCad build and packaging. This job
+  # only populates vcpkg's per-port binary cache (saved even if it times out,
+  # so a first run that does not finish still leaves the next one most of the
+  # way there); the installer job then restores it and configures in minutes.
+  # ABI parity with kicad-win-builder's own configure comes from the same vcpkg
+  # checkout, triplet overlay and install options (patches/kicad-win-builder).
+  # ---------------------------------------------------------------------------
+  windows-deps:
     if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'windows')
-    name: windows x64
+    name: windows x64 (vcpkg dependencies)
     needs: meta
     runs-on: windows-2022
     timeout-minutes: 360
     env:
       VERSION: ${{ needs.meta.outputs.version }}
-      VCPKG_ROOT: C:\vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: C:\vcpkg-cache
       VCPKG_BINARY_SOURCES: clear;default,readwrite
       VCPKG_MAX_CONCURRENCY: "4"
+      # kicad-win-builder exports this from its settings; mirror it so both
+      # jobs see the same environment.
+      VCPKG_PLATFORM_TOOLSET: v142
     steps:
       - uses: actions/checkout@v4
 
-      # The KiCad source lives on C: next to its build directory: KiCad's
-      # banned-functions check computes source paths relative to the build
-      # tree, which breaks across drives (D:\a workspace vs C:\ build).
+      # Same drive as the build directory (KiCad's banned-functions check
+      # computes source paths relative to the build tree, which breaks across
+      # D:\a and C:\).
       - name: Check out patched KiCad
         shell: bash
         run: KICAD_DIR=/c/kicad-src SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad
@@ -291,12 +366,8 @@ jobs:
         run: |
           baseline="$(python3 -c "import json;print(json.load(open('C:/kicad-src/vcpkg-configuration.json'))['default-registry']['baseline'])")"
           echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-          echo "manifest=$(sha256sum C:/kicad-src/vcpkg.json C:/kicad-src/vcpkg-configuration.json | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "manifest=$(cat C:/kicad-src/vcpkg.json C:/kicad-src/vcpkg-configuration.json | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
-      # The dependency set (OCCT, wxWidgets, Boost, Python, wxPython, ...) is
-      # hours of compile on a 4-core runner. vcpkg's binary cache is stored
-      # per port, and saved even if the job times out, so a first run that
-      # does not finish still leaves the next one most of the way there.
       - name: Restore vcpkg binary cache
         id: vcpkg-cache
         uses: actions/cache/restore@v4
@@ -328,13 +399,9 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DVCPKG_OVERLAY_TRIPLETS="C:/kicad-src/tools/custom_vcpkg_triplets" `
             -DVCPKG_INSTALL_OPTIONS="--clean-after-build;--x-abi-tools-use-exact-versions" `
-            -DCMAKE_INSTALL_PREFIX=C:\kicad-out `
             -DKICAD_SCRIPTING_WXPYTHON=ON `
-            -DKICAD_USE_OCC=ON `
             -DKICAD_BUILD_I18N=OFF `
             -DKICAD_BUILD_QA_TESTS=OFF `
-            -DKICAD_USE_SENTRY=OFF `
-            -DKICAD_INSTALL_DEMOS=OFF `
             -DKICAD_WIN32_DPI_AWARE=ON
 
       - name: Save vcpkg binary cache
@@ -344,42 +411,164 @@ jobs:
           path: C:\vcpkg-cache
           key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
-      - name: Build
-        shell: pwsh
-        run: cmake --build C:\kicad-src\build\windows --parallel 4
+  # ---------------------------------------------------------------------------
+  # Windows, part 2: kicad-win-builder (gitlab.com/kicad/packaging/kicad-win-builder),
+  # the tool that makes the installers on kicad.org: -Init fetches its tools
+  # (NSIS, SWIG, gettext, embedded Python, ...), -Build configures KiCad against
+  # vcpkg and compiles it, -Package assembles the install tree with the
+  # symbol/footprint/template/3D libraries and bundled Python, and runs NSIS.
+  # Everything hangs off the builder's own directory, so it lives on C: (the
+  # D: workspace is ~14 GB; the 3D models alone are ~3 GB twice).
+  # ---------------------------------------------------------------------------
+  windows:
+    if: github.event_name != 'workflow_dispatch' || contains(github.event.inputs.platforms, 'windows')
+    name: windows x64 (installer)
+    needs: [meta, windows-deps]
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      VCPKG_DEFAULT_BINARY_CACHE: C:\vcpkg-cache
+      VCPKG_BINARY_SOURCES: clear;default,readwrite
+      VCPKG_MAX_CONCURRENCY: "4"
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Install and assemble the runtime tree
+      - name: Prepare the machine
         shell: pwsh
         run: |
-          cmake --install C:\kicad-src\build\windows | Out-Null
-          $vcpkg = "C:\kicad-src\build\windows\vcpkg_installed\x64-windows"
-          $out = "C:\kicad-out"
-          # Same assembly kicad-win-builder does: dependency DLLs, ngspice code
-          # models, locale data, and vcpkg's Python (KiCad's plugin venvs need it).
-          Copy-Item "$vcpkg\bin\*.dll" -Destination "$out\bin" -Force
-          if (Test-Path "$vcpkg\etc")            { Copy-Item "$vcpkg\etc" -Destination "$out\etc" -Recurse -Force }
-          if (Test-Path "$vcpkg\lib\ngspice")    { New-Item -ItemType Directory -Force -Path "$out\lib" | Out-Null; Copy-Item "$vcpkg\lib\ngspice" -Destination "$out\lib\ngspice" -Recurse -Force }
-          if (Test-Path "$vcpkg\share\locale")   { New-Item -ItemType Directory -Force -Path "$out\share" | Out-Null; Copy-Item "$vcpkg\share\locale" -Destination "$out\share\locale" -Recurse -Force }
-          if (Test-Path "$vcpkg\tools\python3") {
-            Copy-Item "$vcpkg\tools\python3\*" -Destination "$out\bin" -Recurse -Force
-            Remove-Item "$out\bin\Scripts" -Recurse -Force -ErrorAction SilentlyContinue
-            & "$out\bin\python.exe" -m ensurepip --upgrade
-          }
-          Set-Content -Path "$out\README-INSTALL.txt" -Value @"
-          KiCad (custom build) for Windows x64 -- portable tree, no installer.
+          # Library trees have long paths; Defender scanning slows the multi-GB copies.
+          git config --system core.longpaths true
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Get-PSDrive C, D | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB)}}
 
-          Unzip anywhere and run bin\kicad.exe. Symbol/footprint libraries are not
-          included; point KICAD10_SYMBOL_DIR etc. at an existing KiCad 10 install
-          (Preferences > Configure Paths). Settings live in %APPDATA%\kicad\10.0 and
-          are shared with an installed KiCad 10.
-          "@
-          Compress-Archive -Path "$out\*" -DestinationPath "kicad-$env:VERSION-windows-x64.zip" -CompressionLevel Optimal
-          Get-Item kicad-*.zip
+      # The builder wants KiCad at <builder>\.build\kicad and the four library
+      # repos beside it; with no "ref" in the build config it leaves the trees
+      # exactly as it finds them (a stock config would reset them to the
+      # upstream tag and drop our patches). Shallow clones: the builder's own
+      # would fetch full history (the 3D models repo is many GB of it).
+      - name: Check out kicad-win-builder, patched KiCad and the libraries
+        shell: bash
+        run: |
+          KWB_DIR=/c/kwb SHALLOW=1 scripts/bootstrap.sh kicad-win-builder
+          KICAD_DIR=/c/kwb/.build/kicad SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad
+          source upstream.env
+          for r in kicad-symbols kicad-footprints kicad-packages3D kicad-templates; do
+            git clone -q --depth 1 --branch "$LIB_REF" "https://gitlab.com/kicad/libraries/$r.git" "/c/kwb/.build/$r"
+          done
+          python3 - "$VERSION" <<'PY'
+          import json, sys
+          version = sys.argv[1]
+          # Stable train: the package version is taken verbatim from here.
+          config = {
+              "name:": f"KiCad {version} (kicad-dev)",
+              "output_prefix": "kicad-",
+              "package_version": version,
+              "train": "stable",
+              "build_mode": "Release",
+              "nsis": {"file": "install-8-9-10.nsi"},
+              "sources": {"kicad": {}, "symbols": {}, "footprints": {}, "3dmodels": {}, "templates": {}},
+              "vcpkg": {"manifest_mode": True},
+          }
+          with open("C:/kwb/build-configs/kicad-custom.json", "w") as f:
+              json.dump(config, f, indent=4)
+          print(open("C:/kwb/build-configs/kicad-custom.json").read())
+          PY
+          du -sh /c/kwb/.build/* 2>/dev/null || true
+
+      - name: Read the vcpkg baseline KiCad pins
+        id: vcpkg
+        shell: bash
+        run: |
+          baseline="$(python3 -c "import json;print(json.load(open('C:/kwb/.build/kicad/vcpkg-configuration.json'))['default-registry']['baseline'])")"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "manifest=$(cat C:/kwb/.build/kicad/vcpkg.json C:/kwb/.build/kicad/vcpkg-configuration.json | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcpkg-cache
+          key: vcpkg-win-x64-${{ steps.vcpkg.outputs.baseline }}-${{ steps.vcpkg.outputs.manifest }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-win-x64-${{ steps.vcpkg.outputs.baseline }}-${{ steps.vcpkg.outputs.manifest }}-
+            vcpkg-win-x64-${{ steps.vcpkg.outputs.baseline }}-
+          fail-on-cache-miss: true
+
+      # The builder's own -Vcpkg step would reset the clone to its pinned tool
+      # commit; KiCad's manifest names the registry baseline itself, so a plain
+      # clone at that baseline (the same one the deps job used) is all -Build needs.
+      - name: Set up vcpkg at KiCad's baseline
+        shell: pwsh
+        run: |
+          git clone -q https://github.com/microsoft/vcpkg.git C:\vcpkg
+          git -C C:\vcpkg checkout -q ${{ steps.vcpkg.outputs.baseline }}
+          & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          New-Item -ItemType Directory -Force -Path C:\vcpkg-cache | Out-Null
+
+      - name: Restore kicad-win-builder tools
+        id: kwb-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:\kwb\.support
+            C:\kwb\.downloads
+          key: kwb-tools-${{ hashFiles('upstream.env', 'patches/kicad-win-builder/*') }}
+
+      # build.ps1 relies on non-terminating Write-Error and explicit exit codes;
+      # GitHub's pwsh wrapper would otherwise turn any stderr into a hard stop.
+      # It also sets up the MSVC environment itself (and skips that if one is
+      # already loaded), so no msvc-dev-cmd here.
+      - name: Configure and initialise the builder (downloads NSIS, SWIG, gettext, Python, ...)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & C:\kwb\build.ps1 -Config -VcpkgPath C:\vcpkg -UseMsvcCmake $True
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & C:\kwb\build.ps1 -Init
+          if ($LASTEXITCODE) {
+            Write-Host "-Init failed (sourceforge mirrors are flaky); retrying once"
+            & C:\kwb\build.ps1 -Init
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+
+      - name: Save kicad-win-builder tools
+        if: always() && steps.kwb-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:\kwb\.support
+            C:\kwb\.downloads
+          key: ${{ steps.kwb-tools.outputs.cache-primary-key }}
+
+      - name: Build KiCad
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & C:\kwb\build.ps1 -Build -Arch x64 -BuildConfigName kicad-custom
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-PSDrive C | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+
+      # Ports that had to be built here (a cache miss) are worth keeping.
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg-cache
+          key: vcpkg-win-x64-${{ steps.vcpkg.outputs.baseline }}-${{ steps.vcpkg.outputs.manifest }}-${{ github.run_id }}-installer
+
+      - name: Package the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & C:\kwb\build.ps1 -Package -PackType nsis -Arch x64 -BuildConfigName kicad-custom
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem C:\kwb\.out\*.exe | Format-Table Name, @{n='MB';e={[math]::Round($_.Length/1MB)}}
+          Get-PSDrive C | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: kicad-*-windows-x64.zip
+          path: C:\kwb\.out\kicad-*-x86_64.exe
           if-no-files-found: error
 
   release:
@@ -400,7 +589,7 @@ jobs:
         run: |
           source upstream.env
           {
-            echo "KiCad **$VERSION**: upstream KiCad \`$KICAD_REF\` plus this repository's patches."
+            echo "KiCad **$VERSION**: upstream KiCad \`$KICAD_REF\` plus this repository's patches, packaged with KiCad's own release tooling (kicad-mac-builder, kicad-win-builder, kicad-appimage) so it installs like an official release. Symbol, footprint and template libraries, the 3D models and (macOS) the documentation are included."
             echo
             echo "### Patches"
             for p in patches/kicad/*.patch; do
@@ -408,11 +597,9 @@ jobs:
             done
             echo
             echo "### Downloads"
-            echo "- macOS (Apple Silicon): the \`.dmg\` — drag KiCad to Applications. The app is ad-hoc signed (no Apple Developer ID), so Gatekeeper blocks the first launch; clear the quarantine flag once with \`xattr -dr com.apple.quarantine /Applications/KiCad.app\` (or allow it under System Settings > Privacy & Security). The stock 3D model library is not bundled — point \`KICAD10_3DMODEL_DIR\` (Preferences > Configure Paths) at an existing one, e.g. the official install's \`KiCad.app/Contents/SharedSupport/3dmodels\`."
-            echo "- Windows x64: the \`.zip\` — a portable tree, unzip and run \`bin\\kicad.exe\` (see README-INSTALL.txt inside)."
-            echo "- Linux x86_64: the \`.tar.zst\` — built on Ubuntu 24.04, installs to \`/opt/kicad-custom\` (see README-INSTALL.txt inside)."
-            echo
-            echo "Symbol/footprint libraries are not bundled in the Windows and Linux packages; use an existing KiCad 10 library install."
+            echo "- **macOS (Apple Silicon)** — \`kicad-unified-arm64-$VERSION.dmg\`: open it and drag the **KiCad folder** to Applications (installs \`/Applications/KiCad/KiCad.app\`, replacing an official 10.0 install there). The app is ad-hoc signed (no Apple Developer ID), so Gatekeeper blocks the first launch of a downloaded copy: allow it under System Settings > Privacy & Security, or clear the flag once with \`xattr -dr com.apple.quarantine /Applications/KiCad\`."
+            echo "- **Windows x64** — \`kicad-$VERSION-x86_64.exe\`: the standard NSIS installer. It installs as \"KiCad 10.0\" (same folder and Add/Remove entry as the official 10.0.x release, which it replaces). It is not code-signed, so SmartScreen shows \"Windows protected your PC\" — choose *More info > Run anyway*."
+            echo "- **Linux x86_64** — \`kicad-$VERSION-x86_64.AppImage.tar\` (and \`-lite\`, without the 3D models): \`tar xf\` it, \`chmod +x\` the AppImage and run it, exactly like the AppImage on kicad.org."
           } > notes.md
           ls -la artifacts
           gh release create "$GITHUB_REF_NAME" artifacts/* --title "KiCad $VERSION (custom)" --notes-file notes.md

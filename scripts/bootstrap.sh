@@ -3,15 +3,17 @@
 #
 # Produces the same layout the local dev machine uses:
 #   kicad/              upstream KiCad at $KICAD_REF, branch 10.0-custom = ref + patches/kicad/*
-#   kicad-mac-builder/  upstream builder at $KMB_REF, branch 10.0-custom = ref + patches/kicad-mac-builder/*
+#   kicad-mac-builder/  macOS packager at $KMB_REF   (+ patches/kicad-mac-builder/*)
+#   kicad-win-builder/  Windows packager at $KWB_REF (+ patches/kicad-win-builder/*)
+#   kicad-appimage/     Linux packager at $KAI_REF   (+ patches/kicad-appimage/*)
 #
 # Idempotent: an existing checkout is fetched, reset to the pinned ref and
 # re-patched. Uncommitted local edits in those trees would be lost -- commit
 # them (and `scripts/export-patches.sh`) first.
 #
-#   scripts/bootstrap.sh            # both
-#   scripts/bootstrap.sh kicad      # just KiCad (CI on Linux/Windows)
-#   SHALLOW=1 scripts/bootstrap.sh  # depth-1 clones for CI
+#   scripts/bootstrap.sh                       # everything
+#   scripts/bootstrap.sh kicad kicad-appimage  # just these trees (CI picks per platform)
+#   SHALLOW=1 scripts/bootstrap.sh             # depth-1 clones for CI
 set -euo pipefail
 
 DEV="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,12 +22,26 @@ source "$DEV/upstream.env"
 
 VERSION_TAG="${VERSION_TAG:-}"   # e.g. 10.0.5a: tag the patched KiCad so `git describe` reports it
 
+# upstream.env variable prefix for a tree: KICAD_URL/KICAD_REF, KMB_*, KWB_*, KAI_*
+prefix_of() {
+    case "$1" in
+        kicad) echo KICAD ;;
+        kicad-mac-builder) echo KMB ;;
+        kicad-win-builder) echo KWB ;;
+        kicad-appimage) echo KAI ;;
+        *) echo "unknown tree: $1" >&2; exit 2 ;;
+    esac
+}
+
 checkout() {
-    local name="$1" url="$2" ref="$3" patches="$DEV/patches/$1"
-    # KICAD_DIR / KMB_DIR override where a tree lands (CI on Windows keeps the
-    # KiCad source on the same drive as its build directory).
-    local override_var="$(echo "$name" | tr 'a-z-' 'A-Z_' | sed 's/KICAD_MAC_BUILDER/KMB/')_DIR"
-    local dir="${!override_var:-$DEV/$name}"
+    local name="$1" patches="$DEV/patches/$1"
+    local prefix; prefix="$(prefix_of "$name")"
+    local url_var="${prefix}_URL" ref_var="${prefix}_REF" dir_var="${prefix}_DIR"
+    local url="${!url_var}" ref="${!ref_var}"
+    # <PREFIX>_DIR overrides where a tree lands (CI on Windows keeps sources on
+    # the same drive as their build directories, and kicad-win-builder wants
+    # KiCad inside its own .build/).
+    local dir="${!dir_var:-$DEV/$name}"
 
     if [ ! -d "$dir/.git" ]; then
         echo "== cloning $name ($url @ $ref)"
@@ -54,9 +70,12 @@ checkout() {
     echo "== $name at $(git -C "$dir" log --oneline -1)"
 }
 
-want="${1:-all}"
-[ "$want" = all ] || [ "$want" = kicad ] && checkout kicad "$KICAD_URL" "$KICAD_REF"
-[ "$want" = all ] || [ "$want" = kicad-mac-builder ] && checkout kicad-mac-builder "$KMB_URL" "$KMB_REF"
+if [ $# -eq 0 ] || [ "$1" = all ]; then
+    set -- kicad kicad-mac-builder kicad-win-builder kicad-appimage
+fi
+for tree in "$@"; do
+    checkout "$tree"
+done
 
 KICAD_TREE="${KICAD_DIR:-$DEV/kicad}"
 if [ -n "$VERSION_TAG" ] && [ -d "$KICAD_TREE/.git" ]; then
