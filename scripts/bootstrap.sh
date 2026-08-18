@@ -22,7 +22,10 @@ VERSION_TAG="${VERSION_TAG:-}"   # e.g. 10.0.5a: tag the patched KiCad so `git d
 
 checkout() {
     local name="$1" url="$2" ref="$3" patches="$DEV/patches/$1"
-    local dir="$DEV/$name"
+    # KICAD_DIR / KMB_DIR override where a tree lands (CI on Windows keeps the
+    # KiCad source on the same drive as its build directory).
+    local override_var="$(echo "$name" | tr 'a-z-' 'A-Z_' | sed 's/KICAD_MAC_BUILDER/KMB/')_DIR"
+    local dir="${!override_var:-$DEV/$name}"
 
     if [ ! -d "$dir/.git" ]; then
         echo "== cloning $name ($url @ $ref)"
@@ -55,10 +58,11 @@ want="${1:-all}"
 [ "$want" = all ] || [ "$want" = kicad ] && checkout kicad "$KICAD_URL" "$KICAD_REF"
 [ "$want" = all ] || [ "$want" = kicad-mac-builder ] && checkout kicad-mac-builder "$KMB_URL" "$KMB_REF"
 
-if [ -n "$VERSION_TAG" ] && [ -d "$DEV/kicad/.git" ]; then
+KICAD_TREE="${KICAD_DIR:-$DEV/kicad}"
+if [ -n "$VERSION_TAG" ] && [ -d "$KICAD_TREE/.git" ]; then
     # KiCad takes its version string from `git describe`; an annotated tag on
     # the patched head makes the build report exactly this release name.
-    git -C "$DEV/kicad" -c user.name="kicad-dev" -c user.email="kicad-dev@localhost" \
+    git -C "$KICAD_TREE" -c user.name="kicad-dev" -c user.email="kicad-dev@localhost" \
         tag -f -a "$VERSION_TAG" -m "kicad-dev release $VERSION_TAG" >/dev/null
-    echo "== KiCad will report version: $(git -C "$DEV/kicad" describe)"
+    echo "== KiCad will report version: $(git -C "$KICAD_TREE" describe)"
 fi

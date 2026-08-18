@@ -269,17 +269,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The KiCad source lives on C: next to its build directory: KiCad's
+      # banned-functions check computes source paths relative to the build
+      # tree, which breaks across drives (D:\a workspace vs C:\ build).
       - name: Check out patched KiCad
         shell: bash
-        run: SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad
+        run: KICAD_DIR=/c/kicad-src SHALLOW=1 VERSION_TAG="$VERSION" scripts/bootstrap.sh kicad
 
       - name: Read the vcpkg baseline KiCad pins
         id: vcpkg
         shell: bash
         run: |
-          baseline="$(python3 -c "import json;print(json.load(open('kicad/vcpkg-configuration.json'))['default-registry']['baseline'])")"
+          baseline="$(python3 -c "import json;print(json.load(open('C:/kicad-src/vcpkg-configuration.json'))['default-registry']['baseline'])")"
           echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-          echo "manifest=$(sha256sum kicad/vcpkg.json kicad/vcpkg-configuration.json | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "manifest=$(sha256sum C:/kicad-src/vcpkg.json C:/kicad-src/vcpkg-configuration.json | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       # The dependency set (OCCT, wxWidgets, Boost, Python, wxPython, ...) is
       # hours of compile on a 4-core runner. vcpkg's binary cache is stored
@@ -310,11 +313,11 @@ jobs:
       - name: Configure (installs vcpkg dependencies)
         shell: pwsh
         run: |
-          cmake -S kicad -B C:\kicad-build -G Ninja `
+          cmake -S C:\kicad-src -B C:\kicad-src\build\windows -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DVCPKG_OVERLAY_TRIPLETS="$env:GITHUB_WORKSPACE/kicad/tools/custom_vcpkg_triplets" `
+            -DVCPKG_OVERLAY_TRIPLETS="C:/kicad-src/tools/custom_vcpkg_triplets" `
             -DVCPKG_INSTALL_OPTIONS="--clean-after-build;--x-abi-tools-use-exact-versions" `
             -DCMAKE_INSTALL_PREFIX=C:\kicad-out `
             -DKICAD_SCRIPTING_WXPYTHON=ON `
@@ -334,13 +337,13 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: cmake --build C:\kicad-build --parallel 4
+        run: cmake --build C:\kicad-src\build\windows --parallel 4
 
       - name: Install and assemble the runtime tree
         shell: pwsh
         run: |
-          cmake --install C:\kicad-build | Out-Null
-          $vcpkg = "C:\kicad-build\vcpkg_installed\x64-windows"
+          cmake --install C:\kicad-src\build\windows | Out-Null
+          $vcpkg = "C:\kicad-src\build\windows\vcpkg_installed\x64-windows"
           $out = "C:\kicad-out"
           # Same assembly kicad-win-builder does: dependency DLLs, ngspice code
           # models, locale data, and vcpkg's Python (KiCad's plugin venvs need it).
